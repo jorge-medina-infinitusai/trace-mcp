@@ -67,7 +67,7 @@ export function extractTemporalPython(source: string): TemporalSymbolRef[] {
 
 const TS_WORKFLOW_IMPORT_RE = /from\s+['"]@temporalio\/workflow['"]/;
 const TS_EXPORTED_FUNCTION_RE = /export\s+(?:async\s+)?function\s+(\w+)/g;
-const TS_EXPORTED_CONST_FN_RE = /export\s+const\s+(\w+)\s*=\s*(?:async\s+)?\(/g;
+const TS_EXPORTED_CONST_FN_RE = /export\s+const\s+(\w+)\s*(?::[^=]+)?=\s*(?:async\s+)?\(/g;
 
 // `proxyActivities<...>(...)` is bound one of two ways in real Temporal TS code:
 //   const activities = proxyActivities<typeof activities>(...)       — namespace form,
@@ -183,7 +183,7 @@ const JAVA_INTERFACE_METHOD_RE = /(\w+)\s*\([^;]*\)\s*;/g;
 export const JAVA_NEW_ACTIVITY_STUB_RE =
   /(\w+)\s+(\w+)\s*=\s*Workflow\.newActivityStub\(\s*(\w+)\.class/g;
 
-interface JavaInterfaceExtraction {
+export interface JavaInterfaceExtraction {
   refs: TemporalSymbolRef[];
   /** interfaceName -> method names declared inside it */
   interfaceMethods: Map<string, Set<string>>;

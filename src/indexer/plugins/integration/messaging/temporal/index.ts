@@ -34,6 +34,7 @@ import {
   GO_EXECUTE_ACTIVITY_RE,
   JAVA_NEW_ACTIVITY_STUB_RE,
   PY_EXECUTE_ACTIVITY_RE,
+  type JavaInterfaceExtraction,
   type TemporalRole,
   type TemporalSymbolRef,
 } from './extract.js';
@@ -131,6 +132,17 @@ export class TemporalPlugin implements FrameworkPlugin {
     category: 'messaging' as const,
   };
 
+  /**
+   * Per-file extraction cache populated by `extractNodes`, consumed by
+   * `resolveEdges` so it doesn't re-run the same regex extraction over
+   * every file's source a second time. Falls back to re-extracting when a
+   * file's entry is missing (e.g. an incremental reindex that only called
+   * `extractNodes` for a subset of files), so this is a pure perf cache —
+   * never a correctness dependency.
+   */
+  private readonly pyGoRefCache = new Map<string, TemporalSymbolRef[]>();
+  private readonly javaExtractionCache = new Map<string, JavaInterfaceExtraction>();
+
   detect(ctx: ProjectContext): boolean {
     return hasDependency(
       ctx.allDependencies,
@@ -165,12 +177,16 @@ export class TemporalPlugin implements FrameworkPlugin {
 
     if (language === 'python') {
       refs = extractTemporalPython(source);
+      this.pyGoRefCache.set(filePath, refs);
     } else if (TS_EXTENSIONS.has(language)) {
       refs = extractTemporalTypeScript(source);
     } else if (language === 'java') {
-      refs = extractTemporalJava(source).refs;
+      const extraction = extractTemporalJava(source);
+      this.javaExtractionCache.set(filePath, extraction);
+      refs = extraction.refs;
     } else if (language === 'go') {
       refs = extractTemporalGo(source);
+      this.pyGoRefCache.set(filePath, refs);
     } else {
       return ok({ status: 'ok', symbols: [] } satisfies FileParseResult);
     }
@@ -198,8 +214,8 @@ export class TemporalPlugin implements FrameworkPlugin {
     const edges: RawEdge[] = [];
     const allFiles = ctx.getAllFiles();
 
-    const pyActivityIndex = new Map<string, ResolveSymbol>();
-    const goActivityIndex = new Map<string, ResolveSymbol>();
+    const pyActivityIndex = new Map<string, ResolveSymbol[]>();
+    const goActivityIndex = new Map<string, ResolveSymbol[]>();
     const javaInterfaceMethodIndex = new Map<string, Map<string, ResolveSymbol>>();
     const tsFilesByPath = new Map<string, { id: number; path: string }>();
 
@@ -212,24 +228,13 @@ export class TemporalPlugin implements FrameworkPlugin {
     for (const file of allFiles) {
       if (file.language !== 'python' && file.language !== 'go' && file.language !== 'java')
         continue;
-      const source = ctx.readFile(file.path);
-      if (!source) continue;
-      const symbols = ctx.getSymbolsByFile(file.id) as ResolveSymbol[];
 
-      if (file.language === 'python') {
-        for (const ref of extractTemporalPython(source)) {
-          if (ref.role !== 'activity') continue;
-          const sym = symbols.find((s) => s.name === ref.name && s.kind === 'function');
-          if (sym) pyActivityIndex.set(ref.name, sym);
-        }
-      } else if (file.language === 'go') {
-        for (const ref of extractTemporalGo(source)) {
-          if (ref.role !== 'activity') continue;
-          const sym = symbols.find((s) => s.name === ref.name && s.kind === 'function');
-          if (sym) goActivityIndex.set(ref.name, sym);
-        }
-      } else if (file.language === 'java') {
-        const { interfaceMethods } = extractTemporalJava(source);
+      if (file.language === 'java') {
+        const cached = this.javaExtractionCache.get(file.path);
+        const source = cached ? undefined : ctx.readFile(file.path);
+        if (!cached && !source) continue;
+        const symbols = ctx.getSymbolsByFile(file.id) as ResolveSymbol[];
+        const { interfaceMethods } = cached ?? extractTemporalJava(source!);
         for (const [interfaceName, methods] of interfaceMethods) {
           const methodMap =
             javaInterfaceMethodIndex.get(interfaceName) ?? new Map<string, ResolveSymbol>();
@@ -239,10 +244,45 @@ export class TemporalPlugin implements FrameworkPlugin {
           }
           if (methodMap.size > 0) javaInterfaceMethodIndex.set(interfaceName, methodMap);
         }
+        continue;
+      }
+
+      const cachedRefs = this.pyGoRefCache.get(file.path);
+      const source = cachedRefs ? undefined : ctx.readFile(file.path);
+      if (!cachedRefs && !source) continue;
+      const symbols = ctx.getSymbolsByFile(file.id) as ResolveSymbol[];
+
+      if (file.language === 'python') {
+        const refs = cachedRefs ?? extractTemporalPython(source!);
+        for (const ref of refs) {
+          if (ref.role !== 'activity') continue;
+          const sym = symbols.find((s) => s.name === ref.name && s.kind === 'function');
+          if (!sym) continue;
+          const existing = pyActivityIndex.get(ref.name) ?? [];
+          existing.push(sym);
+          pyActivityIndex.set(ref.name, existing);
+        }
+      } else if (file.language === 'go') {
+        const refs = cachedRefs ?? extractTemporalGo(source!);
+        for (const ref of refs) {
+          if (ref.role !== 'activity') continue;
+          const sym = symbols.find((s) => s.name === ref.name && s.kind === 'function');
+          if (!sym) continue;
+          const existing = goActivityIndex.get(ref.name) ?? [];
+          existing.push(sym);
+          goActivityIndex.set(ref.name, existing);
+        }
       }
     }
 
     for (const file of allFiles) {
+      const isRelevant =
+        file.language === 'python' ||
+        file.language === 'go' ||
+        file.language === 'java' ||
+        TS_EXTENSIONS.has(file.language ?? '');
+      if (!isRelevant) continue;
+
       const source = ctx.readFile(file.path);
       if (!source) continue;
       const symbols = ctx.getSymbolsByFile(file.id) as ResolveSymbol[];
@@ -252,23 +292,23 @@ export class TemporalPlugin implements FrameworkPlugin {
         let m: RegExpExecArray | null;
         while ((m = re.exec(source)) !== null) {
           const identifier = m[1].split('.').pop()!;
-          const target = pyActivityIndex.get(identifier);
-          if (!target) continue;
+          const targets = pyActivityIndex.get(identifier);
+          if (!targets) continue;
           const line = source.slice(0, m.index).split('\n').length;
           const enclosing = findEnclosingSymbol(symbols, line, ['function', 'method']);
           if (!enclosing) continue;
-          edges.push(makeEdge(enclosing.id, target.id));
+          for (const target of targets) edges.push(makeEdge(enclosing.id, target.id));
         }
       } else if (file.language === 'go') {
         const re = new RegExp(GO_EXECUTE_ACTIVITY_RE.source, 'g');
         let m: RegExpExecArray | null;
         while ((m = re.exec(source)) !== null) {
-          const target = goActivityIndex.get(m[1]);
-          if (!target) continue;
+          const targets = goActivityIndex.get(m[1]);
+          if (!targets) continue;
           const line = source.slice(0, m.index).split('\n').length;
           const enclosing = findEnclosingSymbol(symbols, line, ['function']);
           if (!enclosing) continue;
-          edges.push(makeEdge(enclosing.id, target.id));
+          for (const target of targets) edges.push(makeEdge(enclosing.id, target.id));
         }
       } else if (file.language === 'java') {
         const stubRe = new RegExp(JAVA_NEW_ACTIVITY_STUB_RE.source, 'g');
