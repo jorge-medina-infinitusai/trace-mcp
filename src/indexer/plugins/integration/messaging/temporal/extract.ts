@@ -1,21 +1,26 @@
 /**
- * Per-language regex extraction for Temporal workflow/activity code.
+ * Per-language regex extraction for Temporal workflow/activity/signal/query/update code.
  *
  * Temporal's four SDKs mark workflows/activities very differently:
  *
  *   Python (temporalio):    @workflow.defn class + @workflow.run/@workflow.signal/
- *                            @workflow.query methods; @activity.defn functions.
+ *                            @workflow.query/@workflow.update methods; @activity.defn functions.
  *   TypeScript (@temporalio/*): no decorators — workflows are exported functions in
  *                            files importing '@temporalio/workflow'; activities are
  *                            plain exported functions referenced via proxyActivities().
- *   Java (io.temporal):      @WorkflowInterface + @WorkflowMethod on an interface;
- *                            @ActivityInterface + @ActivityMethod on another.
+ *                            Signals/queries/updates are `defineSignal`/`defineQuery`/
+ *                            `defineUpdate` consts registered via `setHandler(...)`.
+ *   Java (io.temporal):      @WorkflowInterface + @WorkflowMethod/@SignalMethod/
+ *                            @QueryMethod/@UpdateMethod on an interface; @ActivityInterface
+ *                            + @ActivityMethod on another.
  *   Go (go.temporal.io/sdk): no annotations at all — functions are identified only
  *                            by being passed to worker.RegisterWorkflow/RegisterActivity.
+ *                            Signals/queries are channel/string-name based
+ *                            (workflow.GetSignalChannel/SetQueryHandler), not symbol-based.
  *                            This is the most heuristic of the four.
  */
 
-export type TemporalRole = 'workflow' | 'activity' | 'signal' | 'query';
+export type TemporalRole = 'workflow' | 'activity' | 'signal' | 'query' | 'update';
 
 export interface TemporalSymbolRef {
   name: string;
@@ -23,7 +28,7 @@ export interface TemporalSymbolRef {
   line: number;
 }
 
-function lineOf(source: string, index: number): number {
+export function lineOf(source: string, index: number): number {
   return source.slice(0, index).split('\n').length;
 }
 
@@ -35,8 +40,16 @@ const PY_WORKFLOW_SIGNAL_METHOD_RE =
   /@workflow\.signal(?:\([^)]*\))?\s*\n\s*(?:async\s+)?def\s+(\w+)/g;
 const PY_WORKFLOW_QUERY_METHOD_RE =
   /@workflow\.query(?:\([^)]*\))?\s*\n\s*(?:async\s+)?def\s+(\w+)/g;
+const PY_WORKFLOW_UPDATE_METHOD_RE =
+  /@workflow\.update(?:\([^)]*\))?\s*\n\s*(?:async\s+)?def\s+(\w+)/g;
 const PY_ACTIVITY_DEFN_RE = /@activity\.defn(?:\([^)]*\))?\s*\n\s*(?:async\s+)?def\s+(\w+)/g;
-export const PY_EXECUTE_ACTIVITY_RE = /\bworkflow\.execute_activity(?:_method)?\s*\(\s*([\w.]+)/g;
+export const PY_EXECUTE_ACTIVITY_RE =
+  /\bworkflow\.execute_activity(?:_method)?\s*\(\s*["']?([\w.]+)/g;
+/** `handle.signal(MyWorkflow.my_signal, ...)` or `handle.signal("signal_name", ...)`. */
+export const PY_SEND_SIGNAL_RE = /\.signal\s*\(\s*["']?([\w.]+)/g;
+export const PY_EXECUTE_CHILD_WORKFLOW_RE =
+  /\bworkflow\.(?:execute|start)_child_workflow\s*\(\s*["']?([\w.]+)/g;
+export const PY_SEND_UPDATE_RE = /\.(?:execute|start)_update\s*\(\s*["']?([\w.]+)/g;
 
 export function extractTemporalPython(source: string): TemporalSymbolRef[] {
   const refs: TemporalSymbolRef[] = [];
@@ -47,16 +60,19 @@ export function extractTemporalPython(source: string): TemporalSymbolRef[] {
       refs.push({ name: m[1], role: 'workflow', line: lineOf(source, m.index) });
     }
   }
-  const signalRe = new RegExp(PY_WORKFLOW_SIGNAL_METHOD_RE.source, 'g');
-  let m: RegExpExecArray | null;
-  while ((m = signalRe.exec(source)) !== null) {
-    refs.push({ name: m[1], role: 'signal', line: lineOf(source, m.index) });
-  }
-  const queryRe = new RegExp(PY_WORKFLOW_QUERY_METHOD_RE.source, 'g');
-  while ((m = queryRe.exec(source)) !== null) {
-    refs.push({ name: m[1], role: 'query', line: lineOf(source, m.index) });
+  for (const [re, role] of [
+    [PY_WORKFLOW_SIGNAL_METHOD_RE, 'signal'],
+    [PY_WORKFLOW_QUERY_METHOD_RE, 'query'],
+    [PY_WORKFLOW_UPDATE_METHOD_RE, 'update'],
+  ] as const) {
+    const r = new RegExp(re.source, 'g');
+    let m: RegExpExecArray | null;
+    while ((m = r.exec(source)) !== null) {
+      refs.push({ name: m[1], role, line: lineOf(source, m.index) });
+    }
   }
   const activityRe = new RegExp(PY_ACTIVITY_DEFN_RE.source, 'g');
+  let m: RegExpExecArray | null;
   while ((m = activityRe.exec(source)) !== null) {
     refs.push({ name: m[1], role: 'activity', line: lineOf(source, m.index) });
   }
@@ -68,6 +84,19 @@ export function extractTemporalPython(source: string): TemporalSymbolRef[] {
 const TS_WORKFLOW_IMPORT_RE = /from\s+['"]@temporalio\/workflow['"]/;
 const TS_EXPORTED_FUNCTION_RE = /export\s+(?:async\s+)?function\s+(\w+)/g;
 const TS_EXPORTED_CONST_FN_RE = /export\s+const\s+(\w+)\s*(?::[^=]+)?=\s*(?:async\s+)?\(/g;
+/** `const cancelSignal = defineSignal<[]>('cancel')` / `defineQuery` / `defineUpdate`. */
+const TS_DEFINE_SIGNAL_QUERY_UPDATE_RE =
+  /\bconst\s+(\w+)\s*=\s*define(Signal|Query|Update)\s*(?:<[^>]*>)?\s*\(\s*['"]([^'"]+)['"]\s*\)/g;
+/** `setHandler(cancelSignal, handlerFn)` — registers the handler for a defined signal/query/update. */
+export const TS_SET_HANDLER_RE = /\bsetHandler\s*\(\s*(\w+)\s*,/g;
+/** `import { foo, bar as baz } from './module'` (relative imports only — that's all we can resolve). */
+const TS_NAMED_IMPORT_RE = /import\s+(?:type\s+)?\{\s*([^}]+?)\s*\}\s*from\s+['"](\.[^'"]+)['"]/g;
+/** `handle.signal(cancelSignal, ...)` — send site for a signal defined via `defineSignal`. */
+export const TS_SEND_SIGNAL_RE = /\.signal\s*\(\s*(\w+)/g;
+/** `handle.executeUpdate(myUpdate, ...)` / `handle.startUpdate(myUpdate, ...)`. */
+export const TS_SEND_UPDATE_RE = /\.(?:executeUpdate|startUpdate)\s*\(\s*(\w+)/g;
+/** `executeChild(childWorkflowFn, ...)` / `startChild(childWorkflowFn, ...)`. */
+export const TS_EXECUTE_CHILD_RE = /\b(?:executeChild|startChild)\s*\(\s*(\w+)/g;
 
 // `proxyActivities<...>(...)` is bound one of two ways in real Temporal TS code:
 //   const activities = proxyActivities<typeof activities>(...)       — namespace form,
@@ -101,6 +130,23 @@ export interface TsActivitiesProxy {
   binding?: string;
   /** Set for `const { greet } = proxyActivities(...)` — calls look like `greet()` directly. */
   names?: DestructuredActivityBinding[];
+}
+
+export interface TsNamedImport {
+  /** The exported identifier on the source module, e.g. `cancelSignal` in `{ cancelSignal as cancel }`. */
+  exportName: string;
+  /** The local identifier calls actually use, e.g. `cancel` in `{ cancelSignal as cancel }`. */
+  localName: string;
+  /** Raw (relative) import specifier, e.g. `'./workflows'`. */
+  modulePath: string;
+}
+
+export interface TsDefineBinding {
+  /** The identifier the defined signal/query/update is bound to locally, e.g. `cancelSignal`. */
+  localName: string;
+  /** The string name Temporal uses on the wire, e.g. `'cancel'`. */
+  definedName: string;
+  kind: 'signal' | 'query' | 'update';
 }
 
 function parseDestructuredNames(raw: string): DestructuredActivityBinding[] {
@@ -157,19 +203,80 @@ export function findTsActivitiesProxies(source: string): TsActivitiesProxy[] {
   return proxies;
 }
 
+/** Resolves `import { foo, bar as baz } from './module'` to (localName, exportName, modulePath) triples. */
+export function findTsNamedImports(source: string): TsNamedImport[] {
+  const imports: TsNamedImport[] = [];
+  const re = new RegExp(TS_NAMED_IMPORT_RE.source, 'g');
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(source)) !== null) {
+    const modulePath = m[2];
+    for (const { exportName, localName } of parseDestructuredNames(m[1])) {
+      imports.push({ exportName, localName, modulePath });
+    }
+  }
+  return imports;
+}
+
+/** Maps each `defineSignal`/`defineQuery`/`defineUpdate` local const to its kind + wire name. */
+export function findTsDefineBindings(source: string): Map<string, TsDefineBinding> {
+  const bindings = new Map<string, TsDefineBinding>();
+  const re = new RegExp(TS_DEFINE_SIGNAL_QUERY_UPDATE_RE.source, 'g');
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(source)) !== null) {
+    const kind = m[2].toLowerCase() as TsDefineBinding['kind'];
+    bindings.set(m[1], { localName: m[1], definedName: m[3], kind });
+  }
+  return bindings;
+}
+
+/** True if `name` is invoked (`name(`) anywhere in `source` outside of the line it's declared on. */
+function isCalledInternally(source: string, name: string, declarationLine: number): boolean {
+  const callRe = new RegExp(`\\b${name}\\s*\\(`, 'g');
+  let m: RegExpExecArray | null;
+  while ((m = callRe.exec(source)) !== null) {
+    if (lineOf(source, m.index) !== declarationLine) return true;
+  }
+  return false;
+}
+
+function extractTsSignalQueryUpdateHandlers(source: string): TemporalSymbolRef[] {
+  const refs: TemporalSymbolRef[] = [];
+  const bindings = findTsDefineBindings(source);
+  const handlerRe = new RegExp(TS_SET_HANDLER_RE.source, 'g');
+  let m: RegExpExecArray | null;
+  while ((m = handlerRe.exec(source)) !== null) {
+    const binding = bindings.get(m[1]);
+    if (!binding) continue;
+    refs.push({ name: binding.definedName, role: binding.kind, line: lineOf(source, m.index) });
+  }
+  return refs;
+}
+
 export function extractTemporalTypeScript(source: string): TemporalSymbolRef[] {
   const refs: TemporalSymbolRef[] = [];
   if (!TS_WORKFLOW_IMPORT_RE.test(source)) return refs;
 
+  // Workflow entry points are only ever invoked by the Temporal runtime, never called
+  // directly within their own file — unlike a helper the workflow calls internally.
+  // Use that to filter out exported-but-internal helpers.
   const fnRe = new RegExp(TS_EXPORTED_FUNCTION_RE.source, 'g');
   let m: RegExpExecArray | null;
   while ((m = fnRe.exec(source)) !== null) {
-    refs.push({ name: m[1], role: 'workflow', line: lineOf(source, m.index) });
+    const line = lineOf(source, m.index);
+    if (!isCalledInternally(source, m[1], line)) {
+      refs.push({ name: m[1], role: 'workflow', line });
+    }
   }
   const constRe = new RegExp(TS_EXPORTED_CONST_FN_RE.source, 'g');
   while ((m = constRe.exec(source)) !== null) {
-    refs.push({ name: m[1], role: 'workflow', line: lineOf(source, m.index) });
+    const line = lineOf(source, m.index);
+    if (!isCalledInternally(source, m[1], line)) {
+      refs.push({ name: m[1], role: 'workflow', line });
+    }
   }
+
+  refs.push(...extractTsSignalQueryUpdateHandlers(source));
+
   return refs;
 }
 
@@ -182,18 +289,37 @@ const JAVA_ACTIVITY_INTERFACE_RE =
 const JAVA_INTERFACE_METHOD_RE = /(\w+)\s*\([^;]*\)\s*;/g;
 export const JAVA_NEW_ACTIVITY_STUB_RE =
   /(\w+)\s+(\w+)\s*=\s*Workflow\.newActivityStub\(\s*(\w+)\.class/g;
+/** `Workflow.newChildWorkflowStub(ChildWorkflow.class)` — links a call to a child workflow. */
+export const JAVA_NEW_CHILD_WORKFLOW_STUB_RE =
+  /(\w+)\s+(\w+)\s*=\s*Workflow\.newChildWorkflowStub\(\s*(\w+)\.class/g;
+/** `WorkflowClient.newWorkflowStub(MyWorkflow.class, ...)` — signals/updates an unrelated running workflow. */
+export const JAVA_NEW_EXTERNAL_WORKFLOW_STUB_RE =
+  /(\w+)\s+(\w+)\s*=\s*WorkflowClient\.newWorkflowStub\(\s*(\w+)\.class/g;
 
 export interface JavaInterfaceExtraction {
   refs: TemporalSymbolRef[];
-  /** interfaceName -> method names declared inside it */
-  interfaceMethods: Map<string, Set<string>>;
+  /** interfaceName -> methodName -> role (signal/query/update methods are tagged individually). */
+  interfaceMethods: Map<string, Map<string, TemporalRole>>;
+}
+
+/** Looks for @SignalMethod/@QueryMethod/@UpdateMethod immediately preceding a method declaration. */
+function roleForJavaWorkflowMethod(
+  body: string,
+  precedingStart: number,
+  methodStart: number,
+): TemporalRole {
+  const preceding = body.slice(precedingStart, methodStart);
+  if (/@SignalMethod\b/.test(preceding)) return 'signal';
+  if (/@QueryMethod\b/.test(preceding)) return 'query';
+  if (/@UpdateMethod\b/.test(preceding)) return 'update';
+  return 'workflow';
 }
 
 export function extractTemporalJava(source: string): JavaInterfaceExtraction {
   const refs: TemporalSymbolRef[] = [];
-  const interfaceMethods = new Map<string, Set<string>>();
+  const interfaceMethods = new Map<string, Map<string, TemporalRole>>();
 
-  for (const [re, role] of [
+  for (const [re, defaultRole] of [
     [JAVA_WORKFLOW_INTERFACE_RE, 'workflow'],
     [JAVA_ACTIVITY_INTERFACE_RE, 'activity'],
   ] as const) {
@@ -201,14 +327,21 @@ export function extractTemporalJava(source: string): JavaInterfaceExtraction {
     let m: RegExpExecArray | null;
     while ((m = r.exec(source)) !== null) {
       const [, interfaceName, body] = m;
-      refs.push({ name: interfaceName, role, line: lineOf(source, m.index) });
+      refs.push({ name: interfaceName, role: defaultRole, line: lineOf(source, m.index) });
 
-      const methods = new Set<string>();
+      const methods = new Map<string, TemporalRole>();
       const methodRe = new RegExp(JAVA_INTERFACE_METHOD_RE.source, 'g');
       let mm: RegExpExecArray | null;
+      let precedingEnd = 0;
       while ((mm = methodRe.exec(body)) !== null) {
-        methods.add(mm[1]);
-        refs.push({ name: mm[1], role, line: lineOf(source, m.index) });
+        const methodName = mm[1];
+        const role: TemporalRole =
+          defaultRole === 'workflow'
+            ? roleForJavaWorkflowMethod(body, precedingEnd, mm.index)
+            : defaultRole;
+        methods.set(methodName, role);
+        refs.push({ name: methodName, role, line: lineOf(source, m.index) });
+        precedingEnd = methodRe.lastIndex;
       }
       interfaceMethods.set(interfaceName, methods);
     }
@@ -219,20 +352,48 @@ export function extractTemporalJava(source: string): JavaInterfaceExtraction {
 
 // ─── Go (go.temporal.io/sdk) ───────────────────────────────────────────────
 
-const GO_REGISTER_WORKFLOW_RE = /\bRegisterWorkflow(?:WithOptions)?\s*\(\s*(\w+)/g;
-const GO_REGISTER_ACTIVITY_RE = /\bRegisterActivity(?:WithOptions)?\s*\(\s*(\w+)/g;
-export const GO_EXECUTE_ACTIVITY_RE = /\bworkflow\.ExecuteActivity\s*\(\s*ctx\s*,\s*(\w+)/g;
+// Accepts both the bare-function form (`w.RegisterActivity(ComposeGreeting)`) and the
+// struct-method DI form (`w.RegisterActivity(a.ComposeGreeting)`) — the latter is resolved
+// to its last dotted segment (`ComposeGreeting`), same as Python's `Type.method` resolution.
+const GO_REGISTER_WORKFLOW_RE = /\bRegisterWorkflow(?:WithOptions)?\s*\(\s*(\w+(?:\.\w+)?)/g;
+const GO_REGISTER_ACTIVITY_RE = /\bRegisterActivity(?:WithOptions)?\s*\(\s*(\w+(?:\.\w+)?)/g;
+export const GO_EXECUTE_ACTIVITY_RE =
+  /\bworkflow\.ExecuteActivity\s*\(\s*ctx\s*,\s*(?:"([\w.]+)"|(\w+(?:\.\w+)?))/g;
+export const GO_EXECUTE_CHILD_WORKFLOW_RE =
+  /\bworkflow\.ExecuteChildWorkflow\s*\(\s*ctx\s*,\s*(?:"([\w.]+)"|(\w+(?:\.\w+)?))/g;
+/** Go signals/queries are channel/string-name based, not symbol-based. */
+export const GO_SIGNAL_CHANNEL_RE = /\bworkflow\.GetSignalChannel\s*\(\s*ctx\s*,\s*"([^"]+)"/g;
+export const GO_QUERY_HANDLER_RE = /\bworkflow\.SetQueryHandler\s*\(\s*ctx\s*,\s*"([^"]+)"/g;
+export const GO_SIGNAL_EXTERNAL_RE =
+  /\b(?:workflow\.SignalExternalWorkflow|client\.SignalWorkflow)\s*\([^)]*?,\s*"([^"]+)"/g;
+
+/** Resolves a Go activity/workflow reference (bare identifier or `recv.Method`) to its function name. */
+export function resolveGoIdentifier(raw: string): string {
+  return raw.includes('.') ? raw.split('.').pop()! : raw;
+}
 
 export function extractTemporalGo(source: string): TemporalSymbolRef[] {
   const refs: TemporalSymbolRef[] = [];
-  const wfRe = new RegExp(GO_REGISTER_WORKFLOW_RE.source, 'g');
+  for (const [re, role] of [
+    [GO_REGISTER_WORKFLOW_RE, 'workflow'],
+    [GO_REGISTER_ACTIVITY_RE, 'activity'],
+  ] as const) {
+    const r = new RegExp(re.source, 'g');
+    let m: RegExpExecArray | null;
+    while ((m = r.exec(source)) !== null) {
+      refs.push({ name: resolveGoIdentifier(m[1]), role, line: lineOf(source, m.index) });
+    }
+  }
+
+  const signalRe = new RegExp(GO_SIGNAL_CHANNEL_RE.source, 'g');
   let m: RegExpExecArray | null;
-  while ((m = wfRe.exec(source)) !== null) {
-    refs.push({ name: m[1], role: 'workflow', line: lineOf(source, m.index) });
+  while ((m = signalRe.exec(source)) !== null) {
+    refs.push({ name: m[1], role: 'signal', line: lineOf(source, m.index) });
   }
-  const actRe = new RegExp(GO_REGISTER_ACTIVITY_RE.source, 'g');
-  while ((m = actRe.exec(source)) !== null) {
-    refs.push({ name: m[1], role: 'activity', line: lineOf(source, m.index) });
+  const queryRe = new RegExp(GO_QUERY_HANDLER_RE.source, 'g');
+  while ((m = queryRe.exec(source)) !== null) {
+    refs.push({ name: m[1], role: 'query', line: lineOf(source, m.index) });
   }
+
   return refs;
 }
