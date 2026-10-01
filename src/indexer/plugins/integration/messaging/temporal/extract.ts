@@ -51,6 +51,26 @@ export const PY_EXECUTE_CHILD_WORKFLOW_RE =
   /\bworkflow\.(?:execute|start)_child_workflow\s*\(\s*["']?([\w.]+)/g;
 export const PY_SEND_UPDATE_RE = /\.(?:execute|start)_update\s*\(\s*["']?([\w.]+)/g;
 
+/**
+ * Module-level `NAME = "value"` (or `NAME: str = "value"`) constant assignment, unindented.
+ * Temporal dispatch call sites (`execute_activity`, `execute_child_workflow`, `.signal(...)`,
+ * `.execute_update(...)`) very commonly pass one of these constants instead of a direct
+ * function/class reference — the constant's *name* differs from the target it names, but its
+ * assigned *value* is conventionally equal to the target symbol's own name.
+ */
+const PY_CONSTANT_ASSIGN_RE = /^([A-Z][A-Z0-9_]*)\s*(?::\s*\w+)?\s*=\s*["']([^"']+)["']/gm;
+
+/** Maps each module-level UPPER_CASE string constant in `source` to its literal value. */
+export function extractPythonConstants(source: string): Map<string, string> {
+  const constants = new Map<string, string>();
+  const re = new RegExp(PY_CONSTANT_ASSIGN_RE.source, 'gm');
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(source)) !== null) {
+    constants.set(m[1], m[2]);
+  }
+  return constants;
+}
+
 export function extractTemporalPython(source: string): TemporalSymbolRef[] {
   const refs: TemporalSymbolRef[] = [];
   for (const re of [PY_WORKFLOW_DEFN_CLASS_RE, PY_WORKFLOW_RUN_METHOD_RE]) {

@@ -35,6 +35,7 @@ import {
   extractTemporalJava,
   extractTemporalPython,
   extractTemporalTypeScript,
+  extractPythonConstants,
   findTsActivitiesProxies,
   findTsDefineBindings,
   findTsNamedImports,
@@ -351,6 +352,11 @@ export class TemporalPlugin implements FrameworkPlugin {
     const pySignalIndex = new Map<string, ResolveSymbol[]>();
     const pyUpdateIndex = new Map<string, ResolveSymbol[]>();
     const pyWorkflowIndex = new Map<string, ResolveSymbol[]>();
+    // Dispatch call sites very commonly pass an imported UPPER_CASE string constant
+    // (e.g. `PLAN_EVALUATION_ACTIVITY`) instead of a direct reference — this indexes
+    // every module-level Python constant project-wide so the second pass can resolve
+    // such an identifier to its literal value before giving up on a by-name lookup.
+    const pyConstantIndex = new Map<string, string>();
     const goActivityIndex = new Map<string, ResolveSymbol[]>();
     const goWorkflowIndex = new Map<string, ResolveSymbol[]>();
     const goSignalIndex = new Map<string, ResolveSymbol[]>();
@@ -451,6 +457,15 @@ export class TemporalPlugin implements FrameworkPlugin {
     }
 
     for (const file of allFiles) {
+      if (file.language !== 'python') continue;
+      const source = ctx.readFile(file.path);
+      if (!source) continue;
+      for (const [name, value] of extractPythonConstants(source)) {
+        if (!pyConstantIndex.has(name)) pyConstantIndex.set(name, value);
+      }
+    }
+
+    for (const file of allFiles) {
       const isRelevant =
         file.language === 'python' ||
         file.language === 'go' ||
@@ -499,7 +514,11 @@ export class TemporalPlugin implements FrameworkPlugin {
           let m: RegExpExecArray | null;
           while ((m = r.exec(source)) !== null) {
             const identifier = resolve(m[1]);
-            const targets = index.get(identifier);
+            let targets = index.get(identifier);
+            if (!targets) {
+              const constValue = pyConstantIndex.get(identifier);
+              if (constValue) targets = index.get(constValue);
+            }
             if (!targets) continue;
             const line = lineOfSource(source, m.index);
             const enclosing = findEnclosingSymbol(symbols, line, ['function', 'method']);

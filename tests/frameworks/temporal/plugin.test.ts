@@ -997,3 +997,154 @@ export async function shippingWorkflow(): Promise<void> {}
     );
   });
 });
+
+describe('TemporalPlugin.resolveEdges — Python string-constant dispatch', () => {
+  it('resolves an activity dispatched by an imported constant to its matching literal value, same file', () => {
+    const src = `
+PLAN_EVALUATION_ACTIVITY = "plan_evaluation_activity"
+
+@workflow.defn
+class PlanWorkflow:
+    @workflow.run
+    async def run(self):
+        return await workflow.execute_activity(PLAN_EVALUATION_ACTIVITY, self)
+
+@activity.defn
+async def plan_evaluation_activity():
+    pass
+`;
+    const ctx: ResolveContext = {
+      rootPath: '/x',
+      getAllFiles: () => [{ id: 1, path: 'workflow.py', language: 'python' }],
+      getSymbolsByFile: () => [
+        { id: 10, symbolId: 'w', name: 'run', kind: 'method', fqn: null, lineStart: 6, lineEnd: 8 },
+        {
+          id: 20,
+          symbolId: 'a',
+          name: 'plan_evaluation_activity',
+          kind: 'function',
+          fqn: null,
+          lineStart: 11,
+          lineEnd: 12,
+        },
+      ],
+      getSymbolByFqn: () => undefined,
+      getNodeId: () => undefined,
+      createNodeIfNeeded: () => 0,
+      readFile: () => src,
+    } as unknown as ResolveContext;
+
+    const edges = new TemporalPlugin().resolveEdges(ctx)._unsafeUnwrap();
+    expect(edges).toContainEqual(
+      expect.objectContaining({
+        sourceRefId: 10,
+        targetRefId: 20,
+        edgeType: 'temporal_executes_activity',
+      }),
+    );
+  });
+
+  it('resolves a constant defined in a different file/package than the dispatch call site', () => {
+    const workflowSrc = `
+from constants import PLAN_EVALUATION_ACTIVITY
+
+@workflow.defn
+class PlanWorkflow:
+    @workflow.run
+    async def run(self):
+        return await workflow.execute_activity(PLAN_EVALUATION_ACTIVITY, self)
+`;
+    const constantsSrc = `
+PLAN_EVALUATION_ACTIVITY = "plan_evaluation_activity"
+`;
+    const activitySrc = `
+@activity.defn
+async def plan_evaluation_activity():
+    pass
+`;
+    const files = [
+      { id: 1, path: 'app/workflows.py', language: 'python' },
+      { id: 2, path: 'app/constants.py', language: 'python' },
+      { id: 3, path: 'other_app/activities.py', language: 'python' },
+    ];
+    const symbolsByFile: Record<number, unknown[]> = {
+      1: [
+        { id: 10, symbolId: 'w', name: 'run', kind: 'method', fqn: null, lineStart: 6, lineEnd: 8 },
+      ],
+      2: [],
+      3: [
+        {
+          id: 30,
+          symbolId: 'a',
+          name: 'plan_evaluation_activity',
+          kind: 'function',
+          fqn: null,
+          lineStart: 3,
+          lineEnd: 4,
+        },
+      ],
+    };
+    const srcByPath: Record<string, string> = {
+      'app/workflows.py': workflowSrc,
+      'app/constants.py': constantsSrc,
+      'other_app/activities.py': activitySrc,
+    };
+    const ctx: ResolveContext = {
+      rootPath: '/x',
+      getAllFiles: () => files,
+      getSymbolsByFile: (fileId: number) => symbolsByFile[fileId] ?? [],
+      getSymbolByFqn: () => undefined,
+      getNodeId: () => undefined,
+      createNodeIfNeeded: () => 0,
+      readFile: (relPath: string) => srcByPath[relPath],
+    } as unknown as ResolveContext;
+
+    const edges = new TemporalPlugin().resolveEdges(ctx)._unsafeUnwrap();
+    expect(edges).toContainEqual(
+      expect.objectContaining({
+        sourceRefId: 10,
+        targetRefId: 30,
+        edgeType: 'temporal_executes_activity',
+      }),
+    );
+  });
+
+  it('does not emit an edge when the constant has no matching target', () => {
+    const src = `
+UNKNOWN_ACTIVITY = "does_not_exist_anywhere"
+
+@workflow.defn
+class PlanWorkflow:
+    @workflow.run
+    async def run(self):
+        return await workflow.execute_activity(UNKNOWN_ACTIVITY, self)
+
+@activity.defn
+async def plan_evaluation_activity():
+    pass
+`;
+    const ctx: ResolveContext = {
+      rootPath: '/x',
+      getAllFiles: () => [{ id: 1, path: 'workflow.py', language: 'python' }],
+      getSymbolsByFile: () => [
+        { id: 10, symbolId: 'w', name: 'run', kind: 'method', fqn: null, lineStart: 6, lineEnd: 8 },
+        {
+          id: 20,
+          symbolId: 'a',
+          name: 'plan_evaluation_activity',
+          kind: 'function',
+          fqn: null,
+          lineStart: 11,
+          lineEnd: 12,
+        },
+      ],
+      getSymbolByFqn: () => undefined,
+      getNodeId: () => undefined,
+      createNodeIfNeeded: () => 0,
+      readFile: () => src,
+    } as unknown as ResolveContext;
+
+    const edges = new TemporalPlugin().resolveEdges(ctx)._unsafeUnwrap();
+    expect(edges).toHaveLength(0);
+  });
+});
