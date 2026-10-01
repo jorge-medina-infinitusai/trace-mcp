@@ -53,12 +53,15 @@ export const PY_SEND_UPDATE_RE = /\.(?:execute|start)_update\s*\(\s*["']?([\w.]+
 
 /**
  * Module-level `NAME = "value"` (or `NAME: str = "value"`) constant assignment, unindented.
+ * Also matches the parenthesized multi-line form black/ruff produce for long values:
+ * `NAME = (\n    "value"\n)` — the optional `\(?` plus `\s*` (which spans newlines) before
+ * the quote absorbs that wrapping.
  * Temporal dispatch call sites (`execute_activity`, `execute_child_workflow`, `.signal(...)`,
  * `.execute_update(...)`) very commonly pass one of these constants instead of a direct
  * function/class reference — the constant's *name* differs from the target it names, but its
  * assigned *value* is conventionally equal to the target symbol's own name.
  */
-const PY_CONSTANT_ASSIGN_RE = /^([A-Z][A-Z0-9_]*)\s*(?::\s*\w+)?\s*=\s*["']([^"']+)["']/gm;
+const PY_CONSTANT_ASSIGN_RE = /^([A-Z][A-Z0-9_]*)\s*(?::\s*\w+)?\s*=\s*\(?\s*["']([^"']+)["']/gm;
 
 /** Maps each module-level UPPER_CASE string constant in `source` to its literal value. */
 export function extractPythonConstants(source: string): Map<string, string> {

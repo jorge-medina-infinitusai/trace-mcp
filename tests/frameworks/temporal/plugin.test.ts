@@ -1147,4 +1147,81 @@ async def plan_evaluation_activity():
     const edges = new TemporalPlugin().resolveEdges(ctx)._unsafeUnwrap();
     expect(edges).toHaveLength(0);
   });
+
+  it('resolves a constant whose value is wrapped in parens across multiple lines, alongside a single-line sibling', () => {
+    const src = `
+LIST_ACTIVITY = "list_activity"
+PROCESS_ACTIVITY = (
+    "process_activity"
+)
+
+@workflow.defn
+class PlanWorkflow:
+    @workflow.run
+    async def run(self):
+        await workflow.execute_activity(LIST_ACTIVITY, self)
+        await workflow.execute_activity(PROCESS_ACTIVITY, self)
+
+@activity.defn
+async def list_activity():
+    pass
+
+@activity.defn
+async def process_activity():
+    pass
+`;
+    const ctx: ResolveContext = {
+      rootPath: '/x',
+      getAllFiles: () => [{ id: 1, path: 'workflow.py', language: 'python' }],
+      getSymbolsByFile: () => [
+        {
+          id: 10,
+          symbolId: 'w',
+          name: 'run',
+          kind: 'method',
+          fqn: null,
+          lineStart: 9,
+          lineEnd: 12,
+        },
+        {
+          id: 20,
+          symbolId: 'a1',
+          name: 'list_activity',
+          kind: 'function',
+          fqn: null,
+          lineStart: 15,
+          lineEnd: 16,
+        },
+        {
+          id: 30,
+          symbolId: 'a2',
+          name: 'process_activity',
+          kind: 'function',
+          fqn: null,
+          lineStart: 19,
+          lineEnd: 20,
+        },
+      ],
+      getSymbolByFqn: () => undefined,
+      getNodeId: () => undefined,
+      createNodeIfNeeded: () => 0,
+      readFile: () => src,
+    } as unknown as ResolveContext;
+
+    const edges = new TemporalPlugin().resolveEdges(ctx)._unsafeUnwrap();
+    expect(edges).toContainEqual(
+      expect.objectContaining({
+        sourceRefId: 10,
+        targetRefId: 20,
+        edgeType: 'temporal_executes_activity',
+      }),
+    );
+    expect(edges).toContainEqual(
+      expect.objectContaining({
+        sourceRefId: 10,
+        targetRefId: 30,
+        edgeType: 'temporal_executes_activity',
+      }),
+    );
+  });
 });
